@@ -20,7 +20,6 @@ package org.apache.helix.task.assigner;
  */
 
 import java.util.Map;
-import org.apache.helix.task.AssignableInstanceManager;
 import org.apache.helix.task.TaskConfig;
 
 public interface TaskAssigner {
@@ -47,17 +46,5 @@ public interface TaskAssigner {
    * @return taskID -> TaskAssignmentResult mappings
    */
   Map<String, TaskAssignResult> assignTasks(Iterable<AssignableInstance> assignableInstances,
-      Iterable<TaskConfig> tasks, String quotaType);
-
-  /**
-   * Assign a collection of tasks on AssignableInstanceManager
-   * When an assignment decision is made, AssignableInstance.assign() must be called for the
-   * instance to modify its internal capacity profile.
-   * @param assignableInstanceManager AssignableInstanceManager
-   * @param tasks TaskConfigs of the same quota type
-   * @param quotaType quota type of the tasks
-   * @return taskID -> TaskAssignmentResult mappings
-   */
-  Map<String, TaskAssignResult> assignTasks(AssignableInstanceManager assignableInstanceManager,
       Iterable<TaskConfig> tasks, String quotaType);
 }

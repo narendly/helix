@@ -86,6 +86,10 @@ public class ThreadCountBasedTaskAssignmentCalculator extends TaskAssignmentCalc
       return new HashMap<>();
     }
 
+    // Get AssignableInstances
+    Iterable<AssignableInstance> assignableInstances =
+        _assignableInstanceManager.getAssignableInstanceMap().values();
+
     // Convert the filtered partitionSet (partition numbers) to TaskConfigs
     Iterable<TaskConfig> taskConfigs = getFilteredTaskConfigs(partitionSet, jobCfg, jobContext);
 
@@ -94,7 +98,7 @@ public class ThreadCountBasedTaskAssignmentCalculator extends TaskAssignmentCalc
 
     // Assign tasks to AssignableInstances
     Map<String, TaskAssignResult> taskAssignResultMap =
-        _taskAssigner.assignTasks(_assignableInstanceManager, taskConfigs, quotaType);
+        _taskAssigner.assignTasks(assignableInstances, taskConfigs, quotaType);
 
     // TODO: Do this with Quota Manager is ready
     // Cache TaskAssignResultMap to prevent double-assign
