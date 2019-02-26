@@ -28,13 +28,15 @@ import org.slf4j.LoggerFactory;
 public class JobDispatcher extends AbstractTaskDispatcher {
   private static final Logger LOG = LoggerFactory.getLogger(JobDispatcher.class);
   private ClusterDataCache _clusterDataCache;
+  private static final Set<TaskState> intemediateStates = new HashSet<>(
+      Arrays.asList(TaskState.IN_PROGRESS, TaskState.NOT_STARTED, TaskState.STOPPING, TaskState.STOPPED));
 
   public void updateCache(ClusterDataCache cache) {
     _clusterDataCache = cache;
   }
 
   public ResourceAssignment processJobStatusUpdateandAssignment(String jobName,
-      CurrentStateOutput currStateOutput, IdealState taskIs) {
+      CurrentStateOutput currStateOutput, WorkflowContext workflowCtx) {
     // Fetch job configuration
     JobConfig jobCfg = _clusterDataCache.getJobConfig(jobName);
     if (jobCfg == null) {
@@ -50,7 +52,7 @@ public class JobDispatcher extends AbstractTaskDispatcher {
       return buildEmptyAssignment(jobName, currStateOutput);
     }
 
-    WorkflowContext workflowCtx = _clusterDataCache.getWorkflowContext(workflowResource);
+
     if (workflowCtx == null) {
       LOG.error("Workflow context is NULL for " + jobName);
       return buildEmptyAssignment(jobName, currStateOutput);
@@ -125,7 +127,7 @@ public class JobDispatcher extends AbstractTaskDispatcher {
     jobState = workflowCtx.getJobState(jobName);
     workflowState = workflowCtx.getWorkflowState();
 
-    if (jobState == TaskState.IN_PROGRESS && (isTimeout(jobCtx.getStartTime(), jobCfg.getTimeout())
+    if (intemediateStates.contains(jobState) && (isTimeout(jobCtx.getStartTime(), jobCfg.getTimeout())
         || TaskState.TIMED_OUT.equals(workflowState))) {
       jobState = TaskState.TIMING_OUT;
       workflowCtx.setJobState(jobName, TaskState.TIMING_OUT);
@@ -155,18 +157,6 @@ public class JobDispatcher extends AbstractTaskDispatcher {
     ResourceAssignment newAssignment =
         computeResourceMapping(jobName, workflowCfg, jobCfg, jobState, jobTgtState, prevAssignment,
             liveInstances, currStateOutput, workflowCtx, jobCtx, partitionsToDrop, _clusterDataCache);
-
-    HelixDataAccessor accessor = _manager.getHelixDataAccessor();
-    PropertyKey propertyKey = accessor.keyBuilder().idealStates(jobName);
-
-    // TODO: will be removed when we are trying to get rid of IdealState
-    taskIs = _clusterDataCache.getIdealState(jobName);
-    if (!partitionsToDrop.isEmpty() && taskIs != null) {
-      for (Integer pId : partitionsToDrop) {
-        taskIs.getRecord().getMapFields().remove(pName(jobName, pId));
-      }
-      accessor.setProperty(propertyKey, taskIs);
-    }
 
     // Update Workflow and Job context in data cache and ZK.
     _clusterDataCache.updateJobContext(jobName, jobCtx);

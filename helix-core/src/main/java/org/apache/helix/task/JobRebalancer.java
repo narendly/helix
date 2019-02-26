@@ -56,8 +56,8 @@ public class JobRebalancer extends TaskRebalancer {
   private JobDispatcher _jobDispatcher;
 
   @Override
-  public ResourceAssignment computeBestPossiblePartitionState(ClusterDataCache clusterData, IdealState taskIs, Resource resource,
-      CurrentStateOutput currStateOutput) {
+  public ResourceAssignment computeBestPossiblePartitionState(ClusterDataCache clusterData, IdealState taskIs,
+      Resource resource, CurrentStateOutput currStateOutput) {
     long startTime = System.currentTimeMillis();
     final String jobName = resource.getResourceName();
     LOG.debug("Computer Best Partition for job: " + jobName);
@@ -68,10 +68,11 @@ public class JobRebalancer extends TaskRebalancer {
     _jobDispatcher.init(_manager);
     _jobDispatcher.updateCache(clusterData);
     _jobDispatcher.setClusterStatusMonitor(_clusterStatusMonitor);
-    ResourceAssignment resourceAssignment =
-        _jobDispatcher.processJobStatusUpdateandAssignment(jobName, currStateOutput, taskIs);
-    LOG.debug(String.format("JobRebalancer computation takes %d ms for Job %s", +System.currentTimeMillis() - startTime,
-        jobName));
+    ResourceAssignment resourceAssignment = _jobDispatcher
+        .processJobStatusUpdateandAssignment(jobName, currStateOutput,
+            clusterData.getWorkflowContext(clusterData.getJobConfig(jobName).getWorkflow()));
+    LOG.debug(String.format("JobRebalancer computation takes %d ms for Job %s",
+        System.currentTimeMillis() - startTime, jobName));
     return resourceAssignment;
   }
 }

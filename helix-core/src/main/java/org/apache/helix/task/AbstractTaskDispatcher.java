@@ -15,11 +15,13 @@ import org.apache.helix.HelixDefinedState;
 import org.apache.helix.HelixManager;
 import org.apache.helix.common.caches.TaskDataCache;
 import org.apache.helix.controller.rebalancer.util.RebalanceScheduler;
+import org.apache.helix.controller.stages.BestPossibleStateOutput;
 import org.apache.helix.controller.stages.ClusterDataCache;
 import org.apache.helix.controller.stages.CurrentStateOutput;
 import org.apache.helix.model.InstanceConfig;
 import org.apache.helix.model.Message;
 import org.apache.helix.model.Partition;
+import org.apache.helix.model.Resource;
 import org.apache.helix.model.ResourceAssignment;
 import org.apache.helix.monitoring.mbeans.ClusterStatusMonitor;
 import org.apache.helix.task.assigner.AssignableInstance;
@@ -49,8 +51,7 @@ public abstract class AbstractTaskDispatcher {
       Set<Integer> skippedPartitions, ClusterDataCache cache) {
 
     // Get AssignableInstanceMap for releasing resources for tasks in terminal states
-    Map<String, AssignableInstance> assignableInstanceMap =
-        cache.getAssignableInstanceManager().getAssignableInstanceMap();
+    AssignableInstanceManager assignableInstanceManager = cache.getAssignableInstanceManager();
 
     // Iterate through all instances
     for (String instance : prevInstanceToTaskAssignments.keySet()) {
@@ -93,7 +94,6 @@ public abstract class AbstractTaskDispatcher {
 
         // Get AssignableInstance for this instance and TaskConfig for releasing resources
         String quotaType = jobCfg.getJobType();
-        AssignableInstance assignableInstance = assignableInstanceMap.get(instance);
         String taskId;
         if (TaskUtil.isGenericTaskJob(jobCfg)) {
           taskId = jobCtx.getTaskIdForPartition(pId);
@@ -118,7 +118,7 @@ public abstract class AbstractTaskDispatcher {
           // transition and make it a NOP
           if (currState == TaskPartitionState.STOPPED && jobTgtState == TargetState.STOP) {
             // This task is STOPPED and not going to be re-run, so release this task
-            assignableInstance.release(taskConfig, quotaType);
+            assignableInstanceManager.release(instance, taskConfig, quotaType);
             continue;
           }
 
@@ -168,7 +168,7 @@ public abstract class AbstractTaskDispatcher {
           } else {
             nextState = TaskPartitionState.STOPPED;
             // This task is STOPPED and not going to be re-run, so release this task
-            assignableInstance.release(taskConfig, quotaType);
+            assignableInstanceManager.release(instance, taskConfig, quotaType);
           }
           paMap.put(pId, new JobRebalancer.PartitionAssignment(instance, nextState.name()));
           assignedPartitions.add(pId);
@@ -191,7 +191,7 @@ public abstract class AbstractTaskDispatcher {
           markPartitionCompleted(jobCtx, pId);
 
           // This task is COMPLETED, so release this task
-          assignableInstance.release(taskConfig, quotaType);
+          assignableInstanceManager.release(instance, taskConfig, quotaType);
         }
           break;
         case TIMED_OUT:
@@ -227,7 +227,7 @@ public abstract class AbstractTaskDispatcher {
             }
           }
           // Release this task
-          assignableInstance.release(taskConfig, quotaType);
+          assignableInstanceManager.release(instance, taskConfig, quotaType);
         }
           break;
         case INIT: {
@@ -247,7 +247,7 @@ public abstract class AbstractTaskDispatcher {
             partitionsToDropFromIs.add(pId);
 
             // Also release resources for these tasks
-            assignableInstance.release(taskConfig, quotaType);
+            assignableInstanceManager.release(instance, taskConfig, quotaType);
           } else if (jobState == TaskState.IN_PROGRESS
               && (jobTgtState != TargetState.STOP && jobTgtState != TargetState.DELETE)) {
             // Job is in progress, implying that tasks are being re-tried, so set it to RUNNING
@@ -267,7 +267,7 @@ public abstract class AbstractTaskDispatcher {
           }
           // If it's DROPPED, release this task. If INIT, do not release
           if (currState == TaskPartitionState.DROPPED) {
-            assignableInstance.release(taskConfig, quotaType);
+            assignableInstanceManager.release(instance, taskConfig, quotaType);
           }
         }
           break;
@@ -529,14 +529,13 @@ public abstract class AbstractTaskDispatcher {
             .containsKey(instance)) {
           continue; // This should not happen; skip!
         }
-        AssignableInstance assignableInstance =
-            cache.getAssignableInstanceManager().getAssignableInstanceMap().get(instance);
+        AssignableInstanceManager assignableInstanceManager = cache.getAssignableInstanceManager();
         String quotaType = jobCfg.getJobType();
         for (int partitionNum : tgtPartitionAssignments.get(instance)) {
           // Get the TaskConfig for this partitionNumber
           String taskId = getTaskId(jobCfg, jobCtx, partitionNum);
           TaskConfig taskConfig = jobCfg.getTaskConfig(taskId);
-          assignableInstance.release(taskConfig, quotaType);
+          assignableInstanceManager.release(instance, taskConfig, quotaType);
         }
         continue;
       }
@@ -593,14 +592,13 @@ public abstract class AbstractTaskDispatcher {
             .containsKey(instance)) {
           continue;
         }
-        AssignableInstance assignableInstance =
-            cache.getAssignableInstanceManager().getAssignableInstanceMap().get(instance);
+        AssignableInstanceManager assignableInstanceManager = cache.getAssignableInstanceManager();
         String quotaType = jobCfg.getJobType();
         for (int partitionNum : throttledSet) {
           // Get the TaskConfig for this partitionNumber
           String taskId = getTaskId(jobCfg, jobCtx, partitionNum);
           TaskConfig taskConfig = jobCfg.getTaskConfig(taskId);
-          assignableInstance.release(taskConfig, quotaType);
+          assignableInstanceManager.release(instance, taskConfig, quotaType);
         }
         LOG.debug(
             throttledSet.size() + "tasks are ready but throttled when assigned to participant.");
@@ -846,16 +844,18 @@ public abstract class AbstractTaskDispatcher {
               // Since the job is aborted, release resources occupied by it
               // Otherwise, we run the risk of resource leak
               if (clusterDataCache != null) {
-                Iterable<AssignableInstance> assignableInstances = clusterDataCache
-                    .getAssignableInstanceManager().getAssignableInstanceMap().values();
+                AssignableInstanceManager assignableInstanceManager =
+                    clusterDataCache.getAssignableInstanceManager();
                 JobConfig jobConfig = jobConfigMap.get(jobToFail);
                 String quotaType = jobConfig.getJobType();
                 Map<String, TaskConfig> taskConfigMap = jobConfig.getTaskConfigMap();
                 // Iterate over all tasks and release them
                 for (Map.Entry<String, TaskConfig> taskEntry : taskConfigMap.entrySet()) {
                   TaskConfig taskConfig = taskEntry.getValue();
-                  for (AssignableInstance assignableInstance : assignableInstances) {
-                    assignableInstance.release(taskConfig, quotaType);
+                  for (String assignableInstanceName : assignableInstanceManager
+                      .getAssignableInstanceNames()) {
+                    assignableInstanceManager
+                        .release(assignableInstanceName, taskConfig, quotaType);
                   }
                 }
               }
@@ -1093,5 +1093,15 @@ public abstract class AbstractTaskDispatcher {
     Date startTime = workflowCfg.getStartTime();
     // Workflow with non-scheduled config or passed start time is ready to schedule.
     return (startTime == null || startTime.getTime() <= System.currentTimeMillis());
+  }
+
+  public void updateBestPossibleStateOutput(String resource,
+      ResourceAssignment partitionStateAssignment, BestPossibleStateOutput output) {
+    // Use the internal MappingCalculator interface to compute the final assignment
+    // The next release will support rebalancers that compute the mapping from start to finish
+    for (Partition partition : partitionStateAssignment.getMappedPartitions()) {
+      Map<String, String> newStateMap = partitionStateAssignment.getReplicaMap(partition);
+      output.setState(resource, partition, newStateMap);
+    }
   }
 }
