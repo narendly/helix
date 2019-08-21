@@ -18,8 +18,7 @@ specific language governing permissions and limitations
 under the License.
 -->
 
-<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
   <modelVersion>4.0.0</modelVersion>
 
   <parent>
@@ -30,7 +29,7 @@ under the License.
 
   <groupId>org.apache.helix</groupId>
   <artifactId>helix</artifactId>
-  <version>0.9.1-SNAPSHOT</version>
+  <version>0.9.2-SNAPSHOT</version>
   <packaging>pom</packaging>
   <name>Apache Helix</name>
 
@@ -271,6 +270,16 @@ under the License.
       </otherArchives>
     </mailingList>
     <mailingList>
+      <name>PR Reviews</name>
+      <post>reviews@helix.apache.org</post>
+      <subscribe>reviews-subscribe@helix.apache.org</subscribe>
+      <unsubscribe>reviews-unsubscribe@helix.apache.org</unsubscribe>
+      <archive>http://mail-archives.apache.org/mod_mbox/helix-reviews/</archive>
+      <otherArchives>
+        <otherArchive>http://helix-reviews.markmail.org</otherArchive>
+      </otherArchives>
+    </mailingList>
+    <mailingList>
       <name>Commits</name>
       <post>commits@helix.apache.org</post>
       <subscribe>commits-subscribe@helix.apache.org</subscribe>
@@ -350,7 +359,7 @@ under the License.
     <helix.scmPubCheckoutDirectory>${user.home}/helix-site/helix-site-content</helix.scmPubCheckoutDirectory>
     <scmSkipDeletedFiles>false</scmSkipDeletedFiles>
     <!-- fix issue with current apache parent pom -->
-    <arguments/>
+    <arguments />
 
     <!-- for svnpubsub site deployment -->
     <helix.release.preparationGoals>clean install</helix.release.preparationGoals>
@@ -361,14 +370,14 @@ under the License.
     <currentRelease>0.8.0</currentRelease>
 
     <!-- OSGi Properties -->
-    <osgi.import/>
-    <osgi.dynamic.import/>
-    <osgi.require.bundles/>
-    <osgi.export/>
-    <osgi.private/>
-    <osgi.ignore/>
-    <osgi.activator/>
-    <osgi.export.service/>
+    <osgi.import />
+    <osgi.dynamic.import />
+    <osgi.require.bundles />
+    <osgi.export />
+    <osgi.private />
+    <osgi.ignore />
+    <osgi.activator />
+    <osgi.export.service />
 
     <!--Skips test in default 'mvn clean install' build command-->
     <!-- <maven.test.skip.exec>true</maven.test.skip.exec> -->

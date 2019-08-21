@@ -21,18 +21,18 @@ package org.apache.helix.rest.server.service;
 
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.function.Function;
 import java.util.stream.Collectors;
 
 import org.apache.helix.ConfigAccessor;
-import org.apache.helix.HelixDataAccessor;
 import org.apache.helix.HelixException;
-import org.apache.helix.PropertyKey;
-import org.apache.helix.ZNRecord;
 import org.apache.helix.model.CurrentState;
 import org.apache.helix.model.ExternalView;
 import org.apache.helix.model.InstanceConfig;
@@ -40,7 +40,7 @@ import org.apache.helix.model.LiveInstance;
 import org.apache.helix.model.RESTConfig;
 import org.apache.helix.rest.client.CustomRestClient;
 import org.apache.helix.rest.client.CustomRestClientFactory;
-import org.apache.helix.rest.server.json.cluster.PartitionHealth;
+import org.apache.helix.rest.common.HelixDataAccessorWrapper;
 import org.apache.helix.rest.server.json.instance.InstanceInfo;
 import org.apache.helix.rest.server.json.instance.StoppableCheck;
 import org.apache.helix.util.InstanceValidationUtil;
@@ -50,28 +50,27 @@ import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.annotations.VisibleForTesting;
-
+import com.google.common.collect.ImmutableList;
 
 public class InstanceServiceImpl implements InstanceService {
   private static final Logger LOG = LoggerFactory.getLogger(InstanceServiceImpl.class);
 
-  private static final String PARTITION_HEALTH_KEY = "PARTITION_HEALTH";
-  private static final String IS_HEALTHY_KEY = "IS_HEALTHY";
-  private static final String EXPIRY_KEY = "EXPIRE";
   private static final ObjectMapper OBJECT_MAPPER = new ObjectMapper();
+  private static final ExecutorService POOL = Executors.newCachedThreadPool();
 
-  private final HelixDataAccessor _dataAccessor;
+  private final HelixDataAccessorWrapper _dataAccessor;
   private final ConfigAccessor _configAccessor;
   private final CustomRestClient _customRestClient;
 
-  public InstanceServiceImpl(HelixDataAccessor dataAccessor, ConfigAccessor configAccessor) {
+  public InstanceServiceImpl(HelixDataAccessorWrapper dataAccessor, ConfigAccessor configAccessor) {
     _dataAccessor = dataAccessor;
     _configAccessor = configAccessor;
     _customRestClient = CustomRestClientFactory.get();
   }
 
   @VisibleForTesting
-  InstanceServiceImpl(HelixDataAccessor dataAccessor, ConfigAccessor configAccessor, CustomRestClient customRestClient) {
+  InstanceServiceImpl(HelixDataAccessorWrapper dataAccessor, ConfigAccessor configAccessor,
+      CustomRestClient customRestClient) {
     _dataAccessor = dataAccessor;
     _configAccessor = configAccessor;
     _customRestClient = customRestClient;
@@ -122,48 +121,105 @@ public class InstanceServiceImpl implements InstanceService {
 
   /**
    * {@inheritDoc}
+   * Single instance stoppable check implementation is a special case of
+   * {@link #batchGetInstancesStoppableChecks(String, List, String)}
+   * <p>
    * Step 1: Perform instance level Helix own health checks
    * Step 2: Perform instance level client side health checks
    * Step 3: Perform partition level (all partitions on the instance) client side health checks
-   * Note: if the check fails at one step, all the following steps won't be executed because the instance cannot be stopped
+   * <p>
+   * Note: if the check fails at one step, the rest steps won't be executed because the instance
+   * cannot be stopped
    */
   @Override
   public StoppableCheck getInstanceStoppableCheck(String clusterId, String instanceName,
       String jsonContent) throws IOException {
-    LOG.info("Perform instance level helix own health checks for {}/{}", clusterId, instanceName);
+    return batchGetInstancesStoppableChecks(clusterId, ImmutableList.of(instanceName), jsonContent)
+        .get(instanceName);
+  }
+
+  @Override
+  public Map<String, StoppableCheck> batchGetInstancesStoppableChecks(String clusterId,
+      List<String> instances, String jsonContent) throws IOException {
+    Map<String, StoppableCheck> finalStoppableChecks = new HashMap<>();
+    Map<String, Future<StoppableCheck>> helixInstanceChecks =
+        instances.stream().collect(Collectors.toMap(Function.identity(),
+            instance -> POOL.submit(() -> performHelixOwnInstanceCheck(clusterId, instance))));
+    List<String> instancesForCustomInstanceLevelChecks =
+        filterInstancesForNextCheck(helixInstanceChecks, finalStoppableChecks);
+    if (instancesForCustomInstanceLevelChecks.isEmpty()) {
+      // if all instances failed at helix custom level checks
+      return finalStoppableChecks;
+    }
+
+    RESTConfig restConfig = _configAccessor.getRESTConfig(clusterId);
+    if (restConfig == null) {
+      String errorMessage =
+          String.format("The cluster %s hasn't enabled client side health checks yet, "
+              + "thus the stoppable check result is inaccurate", clusterId);
+      LOG.error(errorMessage);
+      throw new HelixException(errorMessage);
+    }
+    Map<String, String> customPayLoads = getCustomPayLoads(jsonContent);
+    Map<String, Future<StoppableCheck>> customInstanceLevelChecks =
+        instancesForCustomInstanceLevelChecks.stream()
+            .collect(Collectors.toMap(Function.identity(),
+                instance -> POOL.submit(() -> performCustomInstanceCheck(clusterId, instance,
+                    restConfig.getBaseUrl(instance), customPayLoads))));
+    List<String> instancesForCustomPartitionLevelChecks =
+        filterInstancesForNextCheck(customInstanceLevelChecks, finalStoppableChecks);
+    if (!instancesForCustomPartitionLevelChecks.isEmpty()) {
+      Map<String, StoppableCheck> instancePartitionLevelChecks = performPartitionsCheck(
+          instancesForCustomPartitionLevelChecks, restConfig, customPayLoads);
+      for (Map.Entry<String, StoppableCheck> instancePartitionStoppableCheckEntry : instancePartitionLevelChecks
+          .entrySet()) {
+        finalStoppableChecks.put(instancePartitionStoppableCheckEntry.getKey(),
+            instancePartitionStoppableCheckEntry.getValue());
+      }
+    }
+
+    return finalStoppableChecks;
+  }
+
+  private List<String> filterInstancesForNextCheck(
+      Map<String, Future<StoppableCheck>> futureStoppableCheckByInstance,
+      Map<String, StoppableCheck> finalStoppableCheckByInstance) {
+    List<String> instancesForNextCheck = new ArrayList<>();
+    for (Map.Entry<String, Future<StoppableCheck>> entry : futureStoppableCheckByInstance
+        .entrySet()) {
+      String instance = entry.getKey();
+      try {
+        StoppableCheck stoppableCheck = entry.getValue().get();
+        if (!stoppableCheck.isStoppable()) {
+          // put the check result of the failed-to-stop instances
+          finalStoppableCheckByInstance.put(instance, stoppableCheck);
+        } else {
+          // instance passed this around of check will be checked in the next round
+          instancesForNextCheck.add(instance);
+        }
+      } catch (InterruptedException | ExecutionException e) {
+        LOG.error("Failed to get StoppableChecks in parallel. Instance: {}", instance, e);
+      }
+    }
+
+    return instancesForNextCheck;
+  }
+
+  private StoppableCheck performHelixOwnInstanceCheck(String clusterId, String instanceName) {
+    LOG.info("Perform helix own custom health checks for {}/{}", clusterId, instanceName);
     Map<String, Boolean> helixStoppableCheck = getInstanceHealthStatus(clusterId, instanceName,
         InstanceService.HealthCheck.STOPPABLE_CHECK_LIST);
 
-    StoppableCheck result =
-        new StoppableCheck(helixStoppableCheck, StoppableCheck.Category.HELIX_OWN_CHECK);
-    if (!result.isStoppable()) {
-      return result;
-    }
-    LOG.info("{} passed helix side health checks", instanceName);
-    return performCustomInstanceChecks(clusterId, instanceName, getCustomPayLoads(jsonContent));
+    return new StoppableCheck(helixStoppableCheck, StoppableCheck.Category.HELIX_OWN_CHECK);
   }
 
-  @VisibleForTesting
-  protected StoppableCheck performCustomInstanceChecks(String clusterId, String instanceName,
-      Map<String, String> customPayLoads) throws IOException {
-    StoppableCheck defaultSucceed = new StoppableCheck(true, Collections.emptyList(),
-        StoppableCheck.Category.CUSTOM_INSTANCE_CHECK);
+  private StoppableCheck performCustomInstanceCheck(String clusterId, String instanceName,
+      String baseUrl, Map<String, String> customPayLoads) throws IOException {
     LOG.info("Perform instance level client side health checks for {}/{}", clusterId, instanceName);
-    Optional<String> maybeBaseUrl = getBaseUrl(instanceName, clusterId);
-    if (!maybeBaseUrl.isPresent()) {
-      LOG.warn("Unable to get custom client health endpoint: " + instanceName);
-      return defaultSucceed;
-    }
     try {
-      String baseUrl = maybeBaseUrl.get();
-      StoppableCheck result =
-          new StoppableCheck(_customRestClient.getInstanceStoppableCheck(baseUrl, customPayLoads),
-              StoppableCheck.Category.CUSTOM_INSTANCE_CHECK);
-      if (!result.isStoppable()) {
-        return result;
-      }
-      LOG.info("{} passed client side instance level health checks", instanceName);
-      return performPartitionLevelChecks(clusterId, instanceName, baseUrl, customPayLoads);
+      return new StoppableCheck(
+          _customRestClient.getInstanceStoppableCheck(baseUrl, customPayLoads),
+          StoppableCheck.Category.CUSTOM_INSTANCE_CHECK);
     } catch (IOException e) {
       LOG.error("Failed to perform custom client side instance level health checks for {}/{}",
           clusterId, instanceName, e);
@@ -171,87 +227,30 @@ public class InstanceServiceImpl implements InstanceService {
     }
   }
 
-  @VisibleForTesting
-  protected StoppableCheck performPartitionLevelChecks(String clusterId, String instanceName,
-      String baseUrl, Map<String, String> customPayLoads) throws IOException {
-    LOG.info("Perform partition level health checks for {}/{}", clusterId, instanceName);
-    // pull the health status from ZK
-    PartitionHealth clusterPartitionsHealth = generatePartitionHealthMapFromZK();
-    Map<String, List<String>> expiredPartitionsOnInstances =
-        clusterPartitionsHealth.getExpiredRecords();
-    // update the health status for those expired partitions on instances
-    try {
-      for (Map.Entry<String, List<String>> entry : expiredPartitionsOnInstances.entrySet()) {
-        Map<String, Boolean> partitionHealthStatus =
-            _customRestClient.getPartitionStoppableCheck(baseUrl, entry.getValue(), customPayLoads);
-        partitionHealthStatus.entrySet().forEach(kv -> clusterPartitionsHealth
-            .updatePartitionHealth(instanceName, kv.getKey(), kv.getValue()));
-      }
-    } catch (IOException e) {
-      LOG.error("Failed to perform client side partition level health checks for {}/{}", clusterId,
-          instanceName, e);
-      throw e;
-    }
-    // sibling checks on partitions health for entire cluster
-    PropertyKey.Builder propertyKeyBuilder = _dataAccessor.keyBuilder();
+  private Map<String, StoppableCheck> performPartitionsCheck(List<String> instances,
+      RESTConfig restConfig, Map<String, String> customPayLoads) {
+    Map<String, Map<String, Boolean>> allPartitionsHealthOnLiveInstance =
+        _dataAccessor.getAllPartitionsHealthOnLiveInstance(restConfig, customPayLoads);
     List<ExternalView> externalViews =
-        _dataAccessor.getChildNames(propertyKeyBuilder.externalViews()).stream()
-            .map(externalView -> (ExternalView) _dataAccessor
-                .getProperty(propertyKeyBuilder.externalView(externalView)))
-            .collect(Collectors.toList());
-    List<String> unHealthyPartitions = InstanceValidationUtil.perPartitionHealthCheck(externalViews,
-        clusterPartitionsHealth.getGlobalPartitionHealth(), instanceName, _dataAccessor);
-    return new StoppableCheck(unHealthyPartitions.isEmpty(), unHealthyPartitions,
-        StoppableCheck.Category.CUSTOM_PARTITION_CHECK);
+        _dataAccessor.getChildValues(_dataAccessor.keyBuilder().externalViews());
+    Map<String, StoppableCheck> instanceStoppableChecks = new HashMap<>();
+    for (String instanceName : instances) {
+      List<String> unHealthyPartitions = InstanceValidationUtil.perPartitionHealthCheck(
+          externalViews, allPartitionsHealthOnLiveInstance, instanceName, _dataAccessor);
+      StoppableCheck stoppableCheck = new StoppableCheck(unHealthyPartitions.isEmpty(),
+          unHealthyPartitions, StoppableCheck.Category.CUSTOM_PARTITION_CHECK);
+      instanceStoppableChecks.put(instanceName, stoppableCheck);
+    }
+
+    return instanceStoppableChecks;
   }
 
   private Map<String, String> getCustomPayLoads(String jsonContent) throws IOException {
     Map<String, String> result = new HashMap<>();
     JsonNode jsonNode = OBJECT_MAPPER.readTree(jsonContent);
     // parsing the inputs as string key value pairs
-    jsonNode.fields().forEachRemaining(kv ->
-        result.put(kv.getKey(), kv.getValue().asText())
-    );
+    jsonNode.fields().forEachRemaining(kv -> result.put(kv.getKey(), kv.getValue().asText()));
     return result;
-  }
-
-  @VisibleForTesting
-  protected PartitionHealth generatePartitionHealthMapFromZK() {
-    PartitionHealth partitionHealth = new PartitionHealth();
-
-    // Only checks the instances are online with valid reports
-    List<String> liveInstances =
-        _dataAccessor.getChildNames(_dataAccessor.keyBuilder().liveInstances());
-    for (String instance : liveInstances) {
-      ZNRecord customizedHealth = _dataAccessor
-          .getProperty(_dataAccessor.keyBuilder().healthReport(instance, PARTITION_HEALTH_KEY))
-          .getRecord();
-      for (String partitionName : customizedHealth.getMapFields().keySet()) {
-        try {
-          Map<String, String> healthMap = customizedHealth.getMapField(partitionName);
-          if (healthMap == null
-              || Long.parseLong(healthMap.get(EXPIRY_KEY)) < System.currentTimeMillis()) {
-            // Clean all the existing checks. If we do not clean it, when we do the customized
-            // check,
-            // Helix may think these partitions are only partitions holding on the instance.
-            // But it could potentially have some partitions are unhealthy for expired ones.
-            // It could problem for shutting down instances.
-            partitionHealth.addInstanceThatNeedDirectCallWithPartition(instance, partitionName);
-            continue;
-          }
-
-          partitionHealth.addSinglePartitionHealthForInstance(instance, partitionName,
-              Boolean.valueOf(healthMap.get(IS_HEALTHY_KEY)));
-        } catch (Exception e) {
-          LOG.warn(
-              "Error in processing partition level health for instance {}, partition {}, directly querying API",
-              instance, partitionName, e);
-          partitionHealth.addInstanceThatNeedDirectCallWithPartition(instance, partitionName);
-        }
-      }
-    }
-
-    return partitionHealth;
   }
 
   @VisibleForTesting
@@ -260,62 +259,47 @@ public class InstanceServiceImpl implements InstanceService {
     Map<String, Boolean> healthStatus = new HashMap<>();
     for (HealthCheck healthCheck : healthChecks) {
       switch (healthCheck) {
-        case INVALID_CONFIG:
-          healthStatus.put(HealthCheck.INVALID_CONFIG.name(),
-              InstanceValidationUtil.hasValidConfig(_dataAccessor, clusterId, instanceName));
-          if (!healthStatus.get(HealthCheck.INVALID_CONFIG.name())) {
-            LOG.error("The instance {} doesn't have valid configuration", instanceName);
-            return healthStatus;
-          }
-        case INSTANCE_NOT_ENABLED:
-          healthStatus.put(HealthCheck.INSTANCE_NOT_ENABLED.name(), InstanceValidationUtil
-              .isEnabled(_dataAccessor, instanceName));
-          break;
-        case INSTANCE_NOT_ALIVE:
-          healthStatus.put(HealthCheck.INSTANCE_NOT_ALIVE.name(),
-              InstanceValidationUtil.isAlive(_dataAccessor, instanceName));
-          break;
-        case INSTANCE_NOT_STABLE:
-          boolean isStable = InstanceValidationUtil.isInstanceStable(_dataAccessor, instanceName);
-          healthStatus.put(HealthCheck.INSTANCE_NOT_STABLE.name(), isStable);
-          break;
-        case HAS_ERROR_PARTITION:
-          healthStatus.put(HealthCheck.HAS_ERROR_PARTITION.name(),
-              !InstanceValidationUtil.hasErrorPartitions(_dataAccessor, clusterId, instanceName));
-          break;
-        case HAS_DISABLED_PARTITION:
-          healthStatus.put(HealthCheck.HAS_DISABLED_PARTITION.name(),
-              !InstanceValidationUtil.hasDisabledPartitions(_dataAccessor, clusterId, instanceName));
-          break;
-        case EMPTY_RESOURCE_ASSIGNMENT:
-          healthStatus.put(HealthCheck.EMPTY_RESOURCE_ASSIGNMENT.name(),
-              InstanceValidationUtil.hasResourceAssigned(_dataAccessor, clusterId, instanceName));
-          break;
-        case MIN_ACTIVE_REPLICA_CHECK_FAILED:
-          healthStatus.put(HealthCheck.MIN_ACTIVE_REPLICA_CHECK_FAILED.name(),
-              InstanceValidationUtil.siblingNodesActiveReplicaCheck(_dataAccessor, instanceName));
-          break;
-        default:
-          LOG.error("Unsupported health check: {}", healthCheck);
-          break;
+      case INVALID_CONFIG:
+        healthStatus.put(HealthCheck.INVALID_CONFIG.name(),
+            InstanceValidationUtil.hasValidConfig(_dataAccessor, clusterId, instanceName));
+        if (!healthStatus.get(HealthCheck.INVALID_CONFIG.name())) {
+          LOG.error("The instance {} doesn't have valid configuration", instanceName);
+          return healthStatus;
+        }
+      case INSTANCE_NOT_ENABLED:
+        healthStatus.put(HealthCheck.INSTANCE_NOT_ENABLED.name(),
+            InstanceValidationUtil.isEnabled(_dataAccessor, instanceName));
+        break;
+      case INSTANCE_NOT_ALIVE:
+        healthStatus.put(HealthCheck.INSTANCE_NOT_ALIVE.name(),
+            InstanceValidationUtil.isAlive(_dataAccessor, instanceName));
+        break;
+      case INSTANCE_NOT_STABLE:
+        boolean isStable = InstanceValidationUtil.isInstanceStable(_dataAccessor, instanceName);
+        healthStatus.put(HealthCheck.INSTANCE_NOT_STABLE.name(), isStable);
+        break;
+      case HAS_ERROR_PARTITION:
+        healthStatus.put(HealthCheck.HAS_ERROR_PARTITION.name(),
+            !InstanceValidationUtil.hasErrorPartitions(_dataAccessor, clusterId, instanceName));
+        break;
+      case HAS_DISABLED_PARTITION:
+        healthStatus.put(HealthCheck.HAS_DISABLED_PARTITION.name(),
+            !InstanceValidationUtil.hasDisabledPartitions(_dataAccessor, clusterId, instanceName));
+        break;
+      case EMPTY_RESOURCE_ASSIGNMENT:
+        healthStatus.put(HealthCheck.EMPTY_RESOURCE_ASSIGNMENT.name(),
+            InstanceValidationUtil.hasResourceAssigned(_dataAccessor, clusterId, instanceName));
+        break;
+      case MIN_ACTIVE_REPLICA_CHECK_FAILED:
+        healthStatus.put(HealthCheck.MIN_ACTIVE_REPLICA_CHECK_FAILED.name(),
+            InstanceValidationUtil.siblingNodesActiveReplicaCheck(_dataAccessor, instanceName));
+        break;
+      default:
+        LOG.error("Unsupported health check: {}", healthCheck);
+        break;
       }
     }
 
     return healthStatus;
-  }
-
-  private Optional<String> getBaseUrl(String instance, String clusterId) {
-    RESTConfig restConfig = _configAccessor.getRESTConfig(clusterId);
-    if (restConfig == null) {
-      LOG.error("The cluster {} hasn't enabled client side health checks yet", clusterId);
-      return Optional.empty();
-    }
-    String baseUrl = restConfig.get(RESTConfig.SimpleFields.CUSTOMIZED_HEALTH_URL);
-    // pre-assumption of the url, must be format of "http://*/path", the wildcard is replaceable by the instance vip
-    assert baseUrl.contains("*");
-    // pre-assumption of the instance name, must be format of <instanceVip>_<port>
-    assert instance.contains("_");
-    String instanceVip = instance.substring(0, instance.indexOf('_'));
-    return Optional.of(baseUrl.replace("*", instanceVip));
   }
 }
